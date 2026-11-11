@@ -8,6 +8,7 @@ import {
   resolveTrustedWindowsSystemDirectory,
 } from "../lib/windows-elevation";
 import { atomicWriteFile } from "./atomic-write";
+import { readWindowsProcessCommandLineNative } from "./windows-process-command-line";
 import { getConfigDir, hardenConfigDir } from "./paths";
 import { registerOwnHome, unregisterOwnerRegistryHome } from "./owner-registry";
 
@@ -35,8 +36,12 @@ export type RuntimePortState = {
   pid: number;
   port: number;
   hostname?: string;
+  /** Absolute relaunch prefix written by runtimes that identify their serving install. */
+  command?: string[];
   /** Per-process proof key; protected by the config directory and never served. */
   attestationSecret?: string;
+  /** A Link runtime is draining; new and in-flight sync commits must stand down. */
+  clientStopping?: true;
   /**
    * The live proxy's port when this runtime is a sibling instance started beside it
    * (`src/codex/sibling-start.ts`). `ocx stop` reads it to leave shared client routing alone.
@@ -59,6 +64,7 @@ export function isValidRuntimePortState(value: unknown): value is RuntimePortSta
     && Number(state.port) <= 65535
     && hostnameOk
     && attestationOk
+    && (state.clientStopping === undefined || state.clientStopping === true)
     && siblingOk;
 }
 
@@ -323,6 +329,28 @@ export function setProcessCommandLinePlatformForTests(next: NodeJS.Platform | nu
   processCommandLinePlatformForTests = next;
 }
 
+type ProcessCommandLineNative = (pid: number) => string | undefined;
+let processCommandLineNativeForTests: ProcessCommandLineNative | null = null;
+
+/** Replace the in-process Windows command-line read; null restores the real one. */
+export function setProcessCommandLineNativeForTests(next: ProcessCommandLineNative | null): void {
+  processCommandLineNativeForTests = next;
+}
+
+/** The in-process Windows read, or undefined so the spawned probes take their turn. */
+function readNativeWindowsCommandLine(pid: number): string | undefined {
+  try {
+    if (processCommandLineNativeForTests) return processCommandLineNativeForTests(pid);
+    // A platform override means a test drives the spawned probes with fakes; the real native
+    // read would answer about this machine's process instead and bypass them.
+    if (processCommandLinePlatformForTests !== null) return undefined;
+    return readWindowsProcessCommandLineNative(pid);
+  } catch {
+    // A failed native read must leave the spawned probes their turn, not end the lookup.
+    return undefined;
+  }
+}
+
 export function readProcessCommandLine(pid: number): string | undefined {
   if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
   const platform = processCommandLinePlatformForTests ?? process.platform;
@@ -337,7 +365,12 @@ export function readProcessCommandLine(pid: number): string | undefined {
       }
     }
     if (platform === "win32") {
-      // WMIC is the fast path. Newer Windows images may omit it, so fall back to
+      // The in-process read answers in milliseconds. Get-CimInstance Win32_Process has been
+      // measured at 3.6-5.3 s on a busy machine, past the 3 s bound below, so without it a
+      // live runtime reads as unverified wherever WMIC is gone.
+      const native = readNativeWindowsCommandLine(pid);
+      if (native) return native;
+      // WMIC is the next path. Newer Windows images may omit it, so fall back to
       // the trusted fixed PowerShell binary without consulting PATH or env roots.
       const wmic = join(resolveTrustedWindowsSystemDirectory(), "wbem", "WMIC.exe");
       try {
